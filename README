@@ -1,0 +1,5 @@
+Consume Twitter Streaming API using Twisted
+
+This module is written after having used and benefitted from TwittyTwister.
+I'm creating it not as a replacement, but as something less ambitious and 
+more focused.
