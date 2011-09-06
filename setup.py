@@ -13,7 +13,7 @@ print VERSION
 
 setup(name='twistedstream',
       version=VERSION,
-      py_modules=['twistedstream'],
+      packages=['twistedstream'],
       author='Gareth Lloyd',
       author_email='glloyd@gmail.com',
       license='MIT',
