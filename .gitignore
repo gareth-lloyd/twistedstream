@@ -1,4 +1,4 @@
 *.pyc
 *.swp
-twister/test.py
+twistedstream/test.py
 
