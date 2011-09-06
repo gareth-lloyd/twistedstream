@@ -38,8 +38,6 @@ class TwitterStreamingProtocol(LineOnlyReceiver, TimeoutMixin):
         stream, instead of L{ResponseDone}. Other exceptions are treated
         as error conditions.
         """
-        print 'connection lost'
-        print self.deferred
         self.setTimeout(None)
         if reason.check(ResponseDone, PotentialDataLoss):
             self.deferred.callback(None)

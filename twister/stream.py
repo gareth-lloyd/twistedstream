@@ -1,23 +1,53 @@
 from urllib import quote
-
-from twisted.internet import defer, reactor
-from twisted.web import client, error
-from twisted.web.http_headers import Headers
 from oauth import oauth
 
-import protocol
+from twisted.internet.endpoints import SSL4ClientEndpoint
+from twisted.internet._sslverify import OpenSSLCertificateOptions
+from twisted.internet import defer, reactor
+from twisted.internet.protocol import Factory
 
-STREAM_URL = 'https://stream.twitter.com/1/statuses/%s.json'
+from twisted.web._newclient import Request, HTTP11ClientProtocol
+from twisted.web import error
+from twisted.web.http_headers import Headers
+
+from twisted.python import log
+
+from protocol import TwitterStreamingProtocol
+
+STREAM_HOST= 'stream.twitter.com'
+_STREAM_URL = '/1/statuses/%s.json'
+FILTER = _STREAM_URL % 'filter'
+SAMPLE = _STREAM_URL % 'sample'
+
+# STREAM STATES
+DISCONNECTED = 0
+CONNECTING = 1
+CONNECTED = 2
 
 class Stream(object):
+    """Methods to enable a Twitter OAuth consumer to use an access token
+    to connect to the Twitter Streaming API. An instance should be
+    constructed with a particular consumer and token. You can then use the
+    methods such as follow and track to set up long-lived connections, and
+    to register functions that will be called back with parsed json objects
+    received from Twitter.
+    """
 
-    protocol = protocol.TwitterStreamingProtocol
+    def __init__(self, consumer, token, timeout=60):
+        self._state = DISCONNECTED
 
-    def __init__(self, consumer=None, token=None, timeout=0):
         self.timeout = timeout
         self.consumer = consumer
         self.token = token
-        self.agent = client.Agent(reactor)
+
+        self.twitter_streaming_endpoint = SSL4ClientEndpoint(reactor,
+                STREAM_HOST, 443, OpenSSLCertificateOptions())
+
+        self.http_protocol_factory = Factory()
+        self.http_protocol_factory.protocol = HTTP11ClientProtocol
+
+        self.current_streaming_protocol = None
+        self.current_http_protocol = None
 
     def _make_oauth1_headers(self, http_method, url, parameters={}, headers={}):
         oauth_request = oauth.OAuthRequest.from_consumer_and_token(self.consumer,
@@ -27,38 +57,86 @@ class Stream(object):
         headers.update(oauth_request.to_header())
         return headers
 
-    def _connect(self, api_call, http_method, status_receiver, args):
-        def get_initial_response(response):
-            if response.code == 200:
-                protocol = self.protocol(status_receiver)
-                response.deliverBody(protocol)
-                return protocol
-            else:
-                raise error.Error(response.code, response.phrase)
+    def disconnect(self):
+        if self._state != DISCONNECTED and self.current_http_protocol is not None:
+            self.current_http_protocol._giveUp(None)
+            self.current_http_protocol = None
+            self.current_streaming_protocol = None
+            self._state = DISCONNECTED
 
-        url = STREAM_URL % api_call
-        raw_headers = {}
+    def _build_request(self, http_method, uri, parameters):
+        raw_headers = {'Host': STREAM_HOST}
 
-        args = args or {}
-        arg_str = _urlencode(args)
+        url = 'https://' + STREAM_HOST + uri
+
+        parameters = parameters or {}
+        arg_str = _urlencode(parameters)
+
         if http_method == 'GET':
             url += '?' + arg_str
             body_producer = None
         else:
             raw_headers['Content-Type'] = 'application/x-www-form-urlencoded'
             body_producer = StringProducer(arg_str)
-        auth_headers = self._make_oauth1_headers(http_method, url, args, raw_headers)
+
+        auth_headers = self._make_oauth1_headers(http_method, url, 
+                parameters, raw_headers)
         raw_headers = dict([(name, [value])
                            for name, value
                            in auth_headers.iteritems()])
         headers = Headers(raw_headers)
-        print http_method, url
-        d = self.agent.request(http_method, url, headers, body_producer)
-        d.addCallback(get_initial_response)
-        return d
+        return Request(http_method, uri, headers, body_producer)
 
-    def filter(self, status_receiver, args=None):
-        return self._connect('filter', 'POST', status_receiver, args)
+
+    def _connect(self, uri, http_method, status_receiver, parameters):
+        """
+        Set up callbacks which will connect to the Twitter Streaming API
+        endpoint using the HTTP protocol and then hand off the body data
+        to our own Twitter protocol.
+
+        Return a Deferred which will be fired if we start streaming,
+        successfully or errored if we cannot.
+        """
+        stream_deferred = defer.Deferred()
+        if self._state != DISCONNECTED:
+            raise ValueError
+        else:
+            self._state = CONNECTING
+
+        def response_received(response):
+            """Called by HTTP11ClientProtocol with the response object
+            when response headers have been processed and we're ready
+            to start consuming the body. We do this using a new instance
+            of TwitterStreamingProtocol
+            """
+            if response.code == 200:
+                self.current_streaming_protocol = TwitterStreamingProtocol(status_receiver)
+                response.deliverBody(self.current_streaming_protocol)
+                self._state = CONNECTED
+                stream_deferred.callback(None)
+            else:
+                self.disconnect()
+                stream_deferred.errback(error.Error(response.code, response.phrase))
+
+        def protocol_connected(protocol):
+            """Called with a connected HTTP11ClientProtocol produced by
+            self.http_protocol_factory. Use the protocol to make a Twitter
+            API request.
+            """
+            self.current_http_protocol = protocol
+
+            request = self._build_request(http_method, uri, parameters)
+            deferred = self.current_http_protocol.request(request)
+            deferred.addCallbacks(response_received, log.err)
+            return protocol
+
+        endpoint_deferred = self.twitter_streaming_endpoint.connect(self.http_protocol_factory)
+        endpoint_deferred.addCallbacks(protocol_connected, log.err)
+
+        return stream_deferred
+
+    def filter(self, status_receiver, parameters=None):
+        return self._connect(FILTER, 'POST', status_receiver, parameters)
 
     def follow(self, status_receiver, follow):
         return self.filter(status_receiver, {'follow': ','.join(follow)})
@@ -75,7 +153,6 @@ def _urlencode(headers):
     return '&'.join(encoded)
 
 class StringProducer(object):
-
     def __init__(self, body):
         self.body = body
         self.length = len(body)
