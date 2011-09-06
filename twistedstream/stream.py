@@ -23,6 +23,7 @@ SAMPLE = _STREAM_URL % 'sample'
 DISCONNECTED = 0
 CONNECTING = 1
 CONNECTED = 2
+BACKING_OFF = 4
 
 class Stream(object):
     """Methods to enable a Twitter OAuth consumer to use an access token
