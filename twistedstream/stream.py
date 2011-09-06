@@ -48,7 +48,7 @@ class Stream(object):
         self.twitter_streaming_endpoint = SSL4ClientEndpoint(reactor,
                 STREAM_HOST, 443, OpenSSLCertificateOptions())
 
-    def _make_oauth1_headers(self, http_method, url, parameters={}, headers={}):
+    def _add_oauth_header(self, http_method, url, parameters={}, headers={}):
         oauth_request = oauth.OAuthRequest.from_consumer_and_token(self.consumer,
             token=self.token, http_method=http_method, http_url=url, parameters=parameters)
         oauth_request.sign_request(oauth.OAuthSignatureMethod_HMAC_SHA1(), self.consumer, self.token)
