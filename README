@@ -1,5 +1,7 @@
 Consume Twitter Streaming API using Twisted
 
-This module is written after having used and benefitted from TwittyTwister.
-I'm creating it not as a replacement, but as something less ambitious and 
-more focused.
+This module was written after I used and benefitted from TwittyTwister. I wanted
+something more focused on the Streaming API, and furthermore something which would
+take into account as many of the rules of using the API as possible.
+
+I'm using the Twisted Endpoints API instead of Agent

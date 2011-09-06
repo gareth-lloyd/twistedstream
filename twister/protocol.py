@@ -45,13 +45,4 @@ class TwitterStreamingProtocol(LineOnlyReceiver, TimeoutMixin):
             self.deferred.errback(reason)
 
     def timeoutConnection(self):
-        """
-        Called when the connection times out.
-
-        This protocol is used to process the HTTP response body. Its transport
-        is really a proxy, that does not provide C{loseConnection}. Instead it
-        has C{stopProducing}, which will result in the real transport being
-        closed when called.
-        """
-        self.transport.stopProducing()
         self.deferred.errback(None)

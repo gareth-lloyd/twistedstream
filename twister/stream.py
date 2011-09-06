@@ -40,14 +40,12 @@ class Stream(object):
         self.consumer = consumer
         self.token = token
 
-        self.twitter_streaming_endpoint = SSL4ClientEndpoint(reactor,
-                STREAM_HOST, 443, OpenSSLCertificateOptions())
-
         self.http_protocol_factory = Factory()
         self.http_protocol_factory.protocol = HTTP11ClientProtocol
-
-        self.current_streaming_protocol = None
         self.current_http_protocol = None
+        self.current_streaming_protocol = None
+        self.twitter_streaming_endpoint = SSL4ClientEndpoint(reactor,
+                STREAM_HOST, 443, OpenSSLCertificateOptions())
 
     def _make_oauth1_headers(self, http_method, url, parameters={}, headers={}):
         oauth_request = oauth.OAuthRequest.from_consumer_and_token(self.consumer,
@@ -57,36 +55,22 @@ class Stream(object):
         headers.update(oauth_request.to_header())
         return headers
 
-    def disconnect(self):
-        if self._state != DISCONNECTED and self.current_http_protocol is not None:
-            self.current_http_protocol._giveUp(None)
-            self.current_http_protocol = None
-            self.current_streaming_protocol = None
-            self._state = DISCONNECTED
-
     def _build_request(self, http_method, uri, parameters):
-        raw_headers = {'Host': STREAM_HOST}
-
-        url = 'https://' + STREAM_HOST + uri
-
+        url = _api_url(uri)
         parameters = parameters or {}
         arg_str = _urlencode(parameters)
-
+        headers = {'Host': STREAM_HOST}
         if http_method == 'GET':
             url += '?' + arg_str
             body_producer = None
         else:
-            raw_headers['Content-Type'] = 'application/x-www-form-urlencoded'
+            headers['Content-Type'] = 'application/x-www-form-urlencoded'
             body_producer = StringProducer(arg_str)
 
-        auth_headers = self._make_oauth1_headers(http_method, url, 
-                parameters, raw_headers)
-        raw_headers = dict([(name, [value])
-                           for name, value
-                           in auth_headers.iteritems()])
-        headers = Headers(raw_headers)
+        headers_with_auth = self._add_oauth_header(http_method, url, 
+                parameters, headers)
+        headers = Headers(_format_headers(headers_with_auth))
         return Request(http_method, uri, headers, body_producer)
-
 
     def _connect(self, uri, http_method, status_receiver, parameters):
         """
@@ -135,6 +119,13 @@ class Stream(object):
 
         return stream_deferred
 
+    def disconnect(self):
+        if self._state != DISCONNECTED and self.current_http_protocol is not None:
+            self.current_http_protocol._giveUp(None)
+            self.current_http_protocol = None
+            self.current_streaming_protocol = None
+            self._state = DISCONNECTED
+
     def filter(self, status_receiver, parameters=None):
         return self._connect(FILTER, 'POST', status_receiver, parameters)
 
@@ -151,6 +142,12 @@ def _urlencode(headers):
             (quote(key.encode("utf-8")),
             quote(value.encode("utf-8"))))
     return '&'.join(encoded)
+
+def _format_headers(headers):
+    return dict([(name, [value]) for name, value in headers.iteritems()])
+
+def _api_url(uri):
+    return 'https://' + STREAM_HOST + uri
 
 class StringProducer(object):
     def __init__(self, body):
