@@ -1,48 +1,36 @@
 import json
-from twisted.internet import defer
 from twisted.protocols.basic import LineOnlyReceiver
 from twisted.protocols.policies import TimeoutMixin
-from twisted.python import log
-from twisted.web.client import ResponseDone
-from twisted.web.http import PotentialDataLoss
+from twisted.python import log, failure
+from twisted.web import error
+
+class IStreamReceiver(object):
+    def json(self, obj):
+        pass
+
+    def invalid(self, line):
+        pass
+
+    def disconnected(self, reason):
+        pass
 
 class TwitterStreamingProtocol(LineOnlyReceiver, TimeoutMixin):
-    def __init__(self, callback, timeout_seconds=60):
+    def __init__(self, receiver, timeout_seconds=60):
         self.setTimeout(timeout_seconds)
-        self.callback = callback
-        self.deferred = defer.Deferred()
+        self.receiver = receiver
 
     def lineReceived(self, line):
-        """
-        Decode the JSON-encoded datagram and call the callback.
-        """
+        self.resetTimeout()
         line = line.strip()
         if line:
             try:
                 obj = json.loads(line)
-            except ValueError, e:
-                log.err(e, 'Invalid JSON in stream: %r' % line)
-                return
-            self.callback(obj)
-
-    def dataReceived(self, data):
-        self.resetTimeout()
-        LineOnlyReceiver.dataReceived(self, data)
+                self.receiver.json(obj)
+            except ValueError:
+                self.receiver.invalid(line)
 
     def connectionLost(self, reason):
-        """
-        Called when the body is complete or the connection was lost.
-
-        @note: As the body length is usually not known at the beginning of the
-        response we expect a L{PotentialDataLoss} when Twitter closes the
-        stream, instead of L{ResponseDone}. Other exceptions are treated
-        as error conditions.
-        """
-        self.setTimeout(None)
-        if reason.check(ResponseDone, PotentialDataLoss):
-            self.deferred.callback(None)
-        else:
-            self.deferred.errback(reason)
+        self.receiver.disconnected(reason)
 
     def timeoutConnection(self):
-        self.deferred.errback(None)
+        self.receiver.disconnected(failure.Failure(error.ConnectionLost()))
