@@ -1,8 +1,8 @@
 import json
 from twisted.protocols.basic import LineOnlyReceiver
 from twisted.protocols.policies import TimeoutMixin
-from twisted.python import log, failure
-from twisted.web import error
+from twisted.python import failure
+from twisted.internet import error
 
 class IStreamReceiver(object):
     def json(self, obj):

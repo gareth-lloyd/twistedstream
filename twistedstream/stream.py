@@ -1,16 +1,17 @@
 from urllib import quote
 from oauth import oauth
 
+from twisted.internet import defer, reactor, error
 from twisted.internet.endpoints import SSL4ClientEndpoint
 from twisted.internet._sslverify import OpenSSLCertificateOptions
-from twisted.internet import defer, reactor
 from twisted.internet.protocol import Factory
+from twisted.internet.defer import AlreadyCalledError, CancelledError
 
 from twisted.web._newclient import Request, HTTP11ClientProtocol
-from twisted.web import error
 from twisted.web.http_headers import Headers
 
-from twisted.python import failure
+from twisted.python.failure import Failure
+from twisted.python import log
 
 from protocol import TwitterStreamingProtocol
 
@@ -22,13 +23,23 @@ SAMPLE = _STREAM_URL % 'sample'
 def _api_url(uri):
     return 'https://' + STREAM_HOST + uri
 
-ENDPOINT = SSL4ClientEndpoint(reactor,
-        STREAM_HOST, 443, OpenSSLCertificateOptions())
+FACTORY = Factory()
+FACTORY.protocol = HTTP11ClientProtocol
+
+ENDPOINT = SSL4ClientEndpoint(reactor, STREAM_HOST, 443,
+                OpenSSLCertificateOptions())
+
+MAX_BACKOFF = 240
+
 # STREAM STATES
 DISCONNECTED = 0
 CONNECTING = 1
 CONNECTED = 2
 BACKING_OFF = 4
+
+def _state_must_be(current_state, *acceptable_states):
+    if current_state not in acceptable_states:
+        raise ValueError('Invalid State transition')
 
 class Stream(object):
     """Methods to enable a Twitter OAuth consumer to use an access token
@@ -37,22 +48,34 @@ class Stream(object):
     methods such as follow and track to set up long-lived connections, and
     to register functions that will be called back with parsed json objects
     received from Twitter.
+
+    Stream is a state-machine which can be DISCONNECTED, CONNECTING, 
+    BACKING_OFF or CONNECTED
     """
 
-    def __init__(self, consumer, token, timeout=60):
+    def __init__(self, consumer, token):
+        self.consumer, self.token = consumer, token
+
+        # initial state:
         self.state = DISCONNECTED
-
-        self.timeout = timeout
-        self.consumer = consumer
-        self.token = token
-
-        self.http_factory = Factory()
-        self.http_factory.protocol = HTTP11ClientProtocol
-        self.current_http_protocol = None
-        self.current_protocol = None
+        self.next_backoff = 1
+        self.connected_http = None
+        self.dfr_stream_connected = None
+        self.dfr_reached_host = None
+        self.dfr_got_response = None
 
     def _advance_state_to(self, new_state):
-        pass
+        if new_state == DISCONNECTED:
+            pass
+        elif new_state == CONNECTING:
+            _state_must_be(self.state, DISCONNECTED, BACKING_OFF)
+        elif new_state == CONNECTED:
+            _state_must_be(self.state, CONNECTING)
+        elif new_state == BACKING_OFF:
+            _state_must_be(self.state, CONNECTING)
+        else:
+            raise ValueError('Invalid state')
+        self.state = new_state
 
     def _add_oauth_header(self, http_method, url, parameters={}, headers={}):
         oauth_request = oauth.OAuthRequest.from_consumer_and_token(self.consumer,
@@ -80,67 +103,110 @@ class Stream(object):
         return Request(http_method, uri, headers, body_producer)
 
     def _connect(self, uri, http_method, receiver, parameters):
+        """If already connected, or in the middle of a connection attempt,
+        disconnect. This will cancel any outstanding Deferreds.
+
+        Attempt to connect, immediately if this is the first try, or
+        after a backoff period.
+
+        We return a Deferred. A failure to connect, even after backing off,
+        will will fire off its error callbacks. If we successfully start 
+        consuming the response from Twitter, we fire it with no arguments.
+        """
+        if self.state in (CONNECTING, CONNECTED):
+            self.disconnect()
+
+        if self.dfr_stream_connected is None:
+            self.dfr_stream_connected = defer.Deferred()
+
+        if self.state == BACKING_OFF:
+            reactor.runLater(self.next_backoff, self._do_connect, uri, 
+                    http_method, receiver, parameters)
+        else:
+            self._do_connect(uri, http_method, receiver, parameters)
+
+        return self.dfr_stream_connected
+
+    def _do_connect(self, uri, http_method, receiver, parameters):
         """
         Set up callbacks which will connect to the Twitter Streaming API
         endpoint. There are two stages to the connection process - first we
         attempt to connect to the host, and then send a signed HTTP request.
         The response to this request is passed to an instance of
         TwitterStreamingProtocol.
-
-        We return a Deferred. A failure at either stage will fire off its
-        error callbacks. If we successfully start consuming the response
-        from Twitter, we fire it with no arguments.
         """
-        stream_deferred = defer.Deferred()
-        if self.state != CONNECTING:
-            self.disconnect()
-        else:
-            # is there a way to hook into previous deferred?
-            return 
 
-        def connection_error(failure):
-            stream_deferred.errback(failure)
+        self._advance_state_to(CONNECTING)
 
-        def response_received(response):
+        def connection_failed(reason):
+            log.err(reason, 'Failed connecting to stream')
+            if reason.type == int:
+                # received a status code > 200
+                status_code = reason.value
+                # recoverable?
+            if self.next_backoff >= MAX_BACKOFF:
+                self.dfr_stream_connected.errback(reason)
+                self.disconnect() # TODO reason
+                return
+
+            self.next_backoff = self._next_backoff(reason)
+            log.msg('Backing off %ss' % self.next_backoff)
+            self._advance_state_to(BACKING_OFF)
+            self._connect(uri, http_method, receiver, parameters)
+
+        def got_response(response):
             """Called with the HTTP response object
             """
             if response.code == 200:
-                self.current_protocol = TwitterStreamingProtocol(receiver)
-                self.current_protocol.deferred.addBoth(self.disconnect)
-
-                response.deliverBody(self.current_protocol)
-                self.state = CONNECTED
-                stream_deferred.callback(None)
+                response.deliverBody(TwitterStreamingProtocol(receiver))
+                self._advance_state_to(CONNECTED)
+                self.dfr_stream_connected.callback(None)
             else:
-                self.disconnect(failure.Failure(error.ConnectionRefusedError()))
-                stream_deferred.errback(failure.Failure(response.code))
+                connection_failed(Failure(response.code))
 
         def protocol_connected(protocol):
-            """Called with a connected HTTP11ClientProtocol.
+            """Called with a connected HTTP11ClientProtocol. We use
+            it to kick off the API request.
             """
-            # keep a reference to the protocol instance
-            self.current_http_protocol = protocol
-
-            # kick off the API request
+            self.connected_http = protocol
             request = self._build_request(http_method, uri, parameters)
-            deferred = self.current_http_protocol.request(request)
-            deferred.addCallbacks(response_received, connection_error)
+            self.dfr_got_response = self.connected_http.request(request)
+            self.dfr_got_response.addCallbacks(got_response, connection_failed)
             return protocol
 
-        self.state = CONNECTING
-        endpoint_deferred = ENDPOINT.connect(self.http_factory)
-        endpoint_deferred.addCallbacks(protocol_connected, connection_error)
+        self.dfr_reached_host = ENDPOINT.connect(FACTORY)
+        self.dfr_reached_host.addCallbacks(protocol_connected, connection_failed)
+        return self.dfr_stream_connected
 
-        return stream_deferred
+    def _next_backoff(self, reason):
+        return self.next_backoff * 2
 
     def disconnect(self, reason=None):
-        if self.current_http_protocol is not None:
+        """Return the Stream to a disconnected state regardless
+        of current state. Attempt to do so cleanly...
+        """
+        if self.connected_http is not None:
             if reason is None:
-                reason = failure.Failure(error.ConnectionDone('Done listening'))
-            self.current_http_protocol._giveUp(reason)
-            self.current_http_protocol = None
-            self.current_protocol = None
-        self.state = DISCONNECTED
+                reason = Failure(error.ConnectionDone('Done listening'))
+            self.connected_http._giveUp(reason)
+            self.connected_http = None
+
+        if self.dfr_reached_host is not None:
+            self.dfr_reached_host.cancel()
+            self.dfr_reached_host = None
+
+        if self.dfr_got_response is not None:
+            self.dfr_got_response.cancel()
+            self.dfr_got_response = None
+
+        if self.dfr_stream_connected is not None:
+            try:
+                self.dfr_stream_connected.errback(
+                    Failure(error.ConnectionDone('disconnected')))
+            except (AlreadyCalledError, CancelledError):
+                pass
+            self.dfr_stream_connected = None
+        self._advance_state_to(DISCONNECTED)
 
     def sample(self, receiver, parameters=None):
         return self._connect(SAMPLE, 'GET', receiver, parameters)
@@ -164,7 +230,6 @@ def _urlencode(headers):
 
 def _format_headers(headers):
     return dict([(name, [value]) for name, value in headers.iteritems()])
-
 
 class StringProducer(object):
     def __init__(self, body):
