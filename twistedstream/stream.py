@@ -51,6 +51,9 @@ class Stream(object):
         self.current_http_protocol = None
         self.current_protocol = None
 
+    def _advance_state_to(self, new_state):
+        pass
+
     def _add_oauth_header(self, http_method, url, parameters={}, headers={}):
         oauth_request = oauth.OAuthRequest.from_consumer_and_token(self.consumer,
             token=self.token, http_method=http_method, http_url=url, parameters=parameters)
@@ -89,7 +92,11 @@ class Stream(object):
         from Twitter, we fire it with no arguments.
         """
         stream_deferred = defer.Deferred()
-        self.disconnect()
+        if self.state != CONNECTING:
+            self.disconnect()
+        else:
+            # is there a way to hook into previous deferred?
+            return 
 
         def connection_error(failure):
             stream_deferred.errback(failure)
