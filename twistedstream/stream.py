@@ -120,7 +120,7 @@ class Stream(object):
             self.dfr_stream_connected = defer.Deferred()
 
         if self.state == BACKING_OFF:
-            reactor.runLater(self.next_backoff, self._do_connect, uri, 
+            reactor.callLater(self.next_backoff, self._do_connect, uri, 
                     http_method, receiver, parameters)
         else:
             self._do_connect(uri, http_method, receiver, parameters)
