@@ -20,16 +20,46 @@ _STREAM_URL = '/1/statuses/%s.json'
 FILTER = _STREAM_URL % 'filter'
 SAMPLE = _STREAM_URL % 'sample'
 
-def _api_url(uri):
-    return 'https://' + STREAM_HOST + uri
-
 FACTORY = Factory()
 FACTORY.protocol = HTTP11ClientProtocol
 
 ENDPOINT = SSL4ClientEndpoint(reactor, STREAM_HOST, 443,
-                OpenSSLCertificateOptions())
+                OpenSSLCertificateOptions(), timeout=2)
 
+HTTP_ERRORS = {
+    401: 'Unauthorized. Your Oauth details must be incorrect.',
+    403: 'Forbidden. You were authenticated but you do not have appropriate access',
+    404: 'Unknown URL. You should not be seeing this error.',
+    406: 'Unacceptable parameters. Please check and retry.',
+    413: 'Your parameter list is too long. Please check and retry.',
+    416: 'Range Unacceptable. Probably caused by erroneous count parameter.',
+    420: 'Rate Limited.',
+    500: 'Internal Server Error.',
+    503: 'Service Overloaded.',
+}
 MAX_BACKOFF = 240
+RECOVERABLE_BACKOFFS = {
+    420: lambda x: MAX_BACKOFF,
+    500: lambda x: x * 2,
+    503: lambda x: x * 4,
+}
+def _calculate_backoff(reason, current_backoff):
+    """Depending on the type of error, calculate a new backoff
+    time. If the error is unrecoverable, return a negative number.
+    """
+    if reason.type == int:
+        # this is a HTTP error. Only some are recoverable.
+        status_code = reason.value
+        err_msg = HTTP_ERRORS.get(status_code,
+            'Unrecognized response from Twitter. Aborting.')
+        log.err(reason, err_msg)
+        if status_code in RECOVERABLE_BACKOFFS:
+            return RECOVERABLE_BACKOFFS[status_code](current_backoff)
+        else:
+            return -1
+    else:
+        # network error. Back off linearly
+        return current_backoff + 1
 
 # STREAM STATES
 DISCONNECTED = 0
@@ -41,16 +71,20 @@ def _state_must_be(current_state, *acceptable_states):
     if current_state not in acceptable_states:
         raise ValueError('Invalid State transition')
 
+
 class Stream(object):
-    """Methods to enable a Twitter OAuth consumer to use an access token
+    """Allows a Twitter OAuth consumer to use an access token
     to connect to the Twitter Streaming API. An instance should be
     constructed with a particular consumer and token. You can then use the
     methods such as follow and track to set up long-lived connections, and
     to register functions that will be called back with parsed json objects
     received from Twitter.
 
-    Stream is a state-machine which can be DISCONNECTED, CONNECTING, 
-    BACKING_OFF or CONNECTED
+    Stream is a state-machine which can be DISCONNECTED, CONNECTING,
+    BACKING_OFF or CONNECTED. The upshot is that an instance of Stream
+    can only open one connection at a time. Of course, there's nothing 
+    to stop a user setting up multiple instances, although Twitter
+    only allows one connection per access token.
     """
 
     def __init__(self, consumer, token):
@@ -58,6 +92,8 @@ class Stream(object):
 
         # initial state:
         self.state = DISCONNECTED
+
+        # state variables
         self.next_backoff = 1
         self.connected_http = None
         self.dfr_stream_connected = None
@@ -77,40 +113,39 @@ class Stream(object):
             raise ValueError('Invalid state')
         self.state = new_state
 
-    def _add_oauth_header(self, http_method, url, parameters={}, headers={}):
+    def _add_oauth_header(self, headers, http_method, url, parameters):
         oauth_request = oauth.OAuthRequest.from_consumer_and_token(self.consumer,
             token=self.token, http_method=http_method, http_url=url, parameters=parameters)
         oauth_request.sign_request(oauth.OAuthSignatureMethod_HMAC_SHA1(), self.consumer, self.token)
 
         headers.update(oauth_request.to_header())
-        return headers
 
     def _build_request(self, http_method, uri, parameters):
-        url = _api_url(uri)
+        url = _url_from_uri(uri)
         parameters = parameters or {}
         arg_str = _urlencode(parameters)
-        headers = {'Host': STREAM_HOST}
+        header_dict = {'Host': STREAM_HOST}
+
         if http_method == 'GET':
             url += '?' + arg_str
             body_producer = None
         else:
-            headers['Content-Type'] = 'application/x-www-form-urlencoded'
+            header_dict['Content-Type'] = 'application/x-www-form-urlencoded'
             body_producer = StringProducer(arg_str)
 
-        headers_with_auth = self._add_oauth_header(http_method, url,
-                parameters, headers)
-        headers = Headers(_format_headers(headers_with_auth))
+        self._add_oauth_header(header_dict, http_method, url, parameters)
+        headers = Headers(_format_headers(header_dict))
         return Request(http_method, uri, headers, body_producer)
 
     def _connect(self, uri, http_method, receiver, parameters):
         """If already connected, or in the middle of a connection attempt,
-        disconnect. This will cancel any outstanding Deferreds.
+        disconnect.
 
         Attempt to connect, immediately if this is the first try, or
         after a backoff period.
 
-        We return a Deferred. A failure to connect, even after backing off,
-        will will fire off its error callbacks. If we successfully start 
+        Return a Deferred. A failure to connect, even after backing off,
+        will fire off its error callbacks. If we successfully start
         consuming the response from Twitter, we fire it with no arguments.
         """
         if self.state in (CONNECTING, CONNECTED):
@@ -120,7 +155,7 @@ class Stream(object):
             self.dfr_stream_connected = defer.Deferred()
 
         if self.state == BACKING_OFF:
-            reactor.callLater(self.next_backoff, self._do_connect, uri, 
+            reactor.callLater(self.next_backoff, self._do_connect, uri,
                     http_method, receiver, parameters)
         else:
             self._do_connect(uri, http_method, receiver, parameters)
@@ -128,31 +163,24 @@ class Stream(object):
         return self.dfr_stream_connected
 
     def _do_connect(self, uri, http_method, receiver, parameters):
-        """
-        Set up callbacks which will connect to the Twitter Streaming API
+        """Set up callbacks which will connect to the Twitter Streaming API
         endpoint. There are two stages to the connection process - first we
         attempt to connect to the host, and then send a signed HTTP request.
         The response to this request is passed to an instance of
         TwitterStreamingProtocol.
         """
-
         self._advance_state_to(CONNECTING)
 
         def connection_failed(reason):
-            log.err(reason, 'Failed connecting to stream')
-            if reason.type == int:
-                # received a status code > 200
-                status_code = reason.value
-                # recoverable?
-            if self.next_backoff >= MAX_BACKOFF:
+            log.err(reason, 'connection failed %s' % reason)
+            self.next_backoff = _calculate_backoff(reason, self.next_backoff)
+            if 0 < self.next_backoff <= MAX_BACKOFF:
+                log.msg('Backing off %ss' % self.next_backoff)
+                self._advance_state_to(BACKING_OFF)
+                self._connect(uri, http_method, receiver, parameters)
+            else:
                 self.dfr_stream_connected.errback(reason)
-                self.disconnect() # TODO reason
-                return
-
-            self.next_backoff = self._next_backoff(reason)
-            log.msg('Backing off %ss' % self.next_backoff)
-            self._advance_state_to(BACKING_OFF)
-            self._connect(uri, http_method, receiver, parameters)
+                self.disconnect(reason)
 
         def got_response(response):
             """Called with the HTTP response object
@@ -164,22 +192,18 @@ class Stream(object):
             else:
                 connection_failed(Failure(response.code))
 
-        def protocol_connected(protocol):
-            """Called with a connected HTTP11ClientProtocol. We use
-            it to kick off the API request.
+        def protocol_connected(connected_http_protocol):
+            """Use the protocol to kick off the API request, and add
+            callbacks to the resulting deferred.
             """
-            self.connected_http = protocol
+            self.connected_http = connected_http_protocol
             request = self._build_request(http_method, uri, parameters)
             self.dfr_got_response = self.connected_http.request(request)
             self.dfr_got_response.addCallbacks(got_response, connection_failed)
-            return protocol
 
         self.dfr_reached_host = ENDPOINT.connect(FACTORY)
         self.dfr_reached_host.addCallbacks(protocol_connected, connection_failed)
         return self.dfr_stream_connected
-
-    def _next_backoff(self, reason):
-        return self.next_backoff * 2
 
     def disconnect(self, reason=None):
         """Return the Stream to a disconnected state regardless
@@ -209,16 +233,32 @@ class Stream(object):
         self._advance_state_to(DISCONNECTED)
 
     def sample(self, receiver, parameters=None):
+        """Receive ~1% of all twitter statuses. 'receiver' must be 
+        an instance of twistedstream.protocol.IStreamReceiver
+        """
         return self._connect(SAMPLE, 'GET', receiver, parameters)
 
     def filter(self, receiver, parameters=None):
+        """Filter twitter statuses according to parameters. 'receiver' 
+        must be an instance of twistedstream.protocol.IStreamReceiver
+        """
         return self._connect(FILTER, 'POST', receiver, parameters)
 
     def follow(self, receiver, follow):
+        """Follow a list of twitter users. 'receiver' must be an 
+        instance of twistedstream.protocol.IStreamReceiver
+        """
         return self.filter(receiver, {'follow': ','.join(follow)})
 
     def track(self, receiver, terms):
+        """Track a list of search terms. 'receiver' must be an 
+        instance of twistedstream.protocol.IStreamReceiver
+        """
         return self.filter(receiver, {'track': ','.join(terms)})
+
+
+def _url_from_uri(uri):
+    return 'https://' + STREAM_HOST + uri
 
 def _urlencode(headers):
     encoded = []
