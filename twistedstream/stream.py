@@ -107,6 +107,7 @@ class Stream(object):
             _state_must_be(self.state, DISCONNECTED, BACKING_OFF)
         elif new_state == CONNECTED:
             _state_must_be(self.state, CONNECTING)
+            self.next_backoff = 1
         elif new_state == BACKING_OFF:
             _state_must_be(self.state, CONNECTING)
         else:
@@ -244,11 +245,11 @@ class Stream(object):
         """
         return self._connect(FILTER, 'POST', receiver, parameters)
 
-    def follow(self, receiver, follow):
+    def follow(self, receiver, follows):
         """Follow a list of twitter users. 'receiver' must be an 
         instance of twistedstream.protocol.IStreamReceiver
         """
-        return self.filter(receiver, {'follow': ','.join(follow)})
+        return self.filter(receiver, {'follow': ','.join(follows)})
 
     def track(self, receiver, terms):
         """Track a list of search terms. 'receiver' must be an 
