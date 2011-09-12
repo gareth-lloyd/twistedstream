@@ -5,8 +5,21 @@ from twisted.python import failure
 from twisted.internet import error
 
 class IStreamReceiver(object):
-    def json(self, obj):
+
+    def status(self, obj):
         pass
+
+    def status_deletion(self, obj):
+        pass
+
+    def location_deletion(self, obj):
+        pass
+
+    def rate_limitation(self, obj):
+        pass
+
+    def json(self, obj):
+        "Default case for an unrecognized json object"
 
     def invalid(self, line):
         pass
@@ -25,7 +38,16 @@ class TwitterStreamingProtocol(LineOnlyReceiver, TimeoutMixin):
         if line:
             try:
                 obj = json.loads(line)
-                self.receiver.json(obj)
+                if 'text' in obj:
+                    self.receiver.status(obj)
+                elif 'delete' in obj:
+                    self.receiver.status_deletion(obj)
+                elif 'scrub_geo' in obj:
+                    self.receiver.location_deletion(obj)
+                elif 'limit' in obj:
+                    self.receiver.rate_limitation(obj)
+                else:
+                    self.receiver.json(obj)
             except ValueError:
                 self.receiver.invalid(line)
 
