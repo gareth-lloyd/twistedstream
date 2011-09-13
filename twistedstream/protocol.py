@@ -48,7 +48,8 @@ class TwitterStreamingProtocol(LineOnlyReceiver, TimeoutMixin):
                     self.receiver.rate_limitation(obj)
                 else:
                     self.receiver.json(obj)
-            except ValueError:
+            except ValueError, e:
+                print e
                 self.receiver.invalid(line)
 
     def connectionLost(self, reason):
