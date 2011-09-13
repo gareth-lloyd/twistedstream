@@ -5,6 +5,13 @@ from twisted.python import failure
 from twisted.internet import error
 
 class IStreamReceiver(object):
+    """Receiver methods should expect a dictionary-like JSON object,
+    containing all the properties passed by the Twitter API. If the
+    API sends through an unrecognized but valid JSON object, it will
+    be passed to the json() method. If an invalid JSON object is
+    received, the line in question will be passed to the invalid()
+    method.
+    """
 
     def status(self, obj):
         pass
