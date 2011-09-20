@@ -5,17 +5,14 @@ from twisted.internet import defer, reactor, error
 from twisted.internet.endpoints import SSL4ClientEndpoint
 from twisted.internet._sslverify import OpenSSLCertificateOptions
 from twisted.internet.protocol import Factory
-from twisted.internet.defer import AlreadyCalledError, CancelledError
-
 from twisted.web._newclient import Request, HTTP11ClientProtocol
 from twisted.web.http_headers import Headers
-
 from twisted.python.failure import Failure
 from twisted.python import log
 
-from protocol import TwitterStreamingProtocol
+from twistedstream.protocol import TwitterStreamingProtocol
 
-STREAM_HOST= 'stream.twitter.com'
+STREAM_HOST = 'stream.twitter.com'
 _STREAM_URL = '/1/statuses/%s.json'
 FILTER = _STREAM_URL % 'filter'
 SAMPLE = _STREAM_URL % 'sample'
@@ -24,25 +21,28 @@ FACTORY = Factory()
 FACTORY.protocol = HTTP11ClientProtocol
 
 ENDPOINT = SSL4ClientEndpoint(reactor, STREAM_HOST, 443,
-                OpenSSLCertificateOptions(), timeout=2)
+                OpenSSLCertificateOptions(), timeout=35)
+HTTP_TIMEOUT = 55
 
 HTTP_ERRORS = {
     401: 'Unauthorized. Your Oauth details must be incorrect.',
-    403: 'Forbidden. You were authenticated but you do not have appropriate access',
-    404: 'Unknown URL. You should not be seeing this error.',
-    406: 'Unacceptable parameters. Please check and retry.',
+    403: 'Forbidden. You authenticated successfully but you do not have appropriate access',
+    404: 'We attempted to connect to an unknown URL. Something has changed in Twitter\'s API.',
+    406: 'You supplied unacceptable parameters. Please check and retry.',
     413: 'Your parameter list is too long. Please check and retry.',
     416: 'Range Unacceptable. Probably caused by erroneous count parameter.',
-    420: 'Rate Limited.',
-    500: 'Internal Server Error.',
-    503: 'Service Overloaded.',
+    420: 'Rate Limited. You have tried to connect too many times.',
+    500: 'Twitter experienced an internal Server Error.',
+    503: 'Twitter is currently overloaded.',
 }
-MAX_BACKOFF = 240
+MAX_BACKOFF = 120
 RECOVERABLE_BACKOFFS = {
+    401: lambda x: x * 2 if x >= 10 else 10, # Twitter occasionally throws unnecessary 401s
     420: lambda x: MAX_BACKOFF,
-    500: lambda x: x * 2,
-    503: lambda x: x * 4,
+    500: lambda x: x * 2 if x >= 10 else 10,
+    503: lambda x: x * 4 if x >= 10 else 10, # backoff more aggressively
 }
+
 def _calculate_backoff(reason, current_backoff):
     """Depending on the type of error, calculate a new backoff
     time. If the error is unrecoverable, return a negative number.
@@ -82,7 +82,7 @@ class Stream(object):
 
     Stream is a state-machine which can be DISCONNECTED, CONNECTING,
     BACKING_OFF or CONNECTED. The upshot is that an instance of Stream
-    can only open one connection at a time. Of course, there's nothing 
+    can only open one connection at a time. Of course, there's nothing
     to stop a user setting up multiple instances, although Twitter
     only allows one connection per access token.
     """
@@ -96,6 +96,7 @@ class Stream(object):
         # state variables
         self.next_backoff = 1
         self.connected_http = None
+        self.delayed_connect = None
         self.dfr_stream_connected = None
         self.dfr_reached_host = None
         self.dfr_got_response = None
@@ -142,12 +143,11 @@ class Stream(object):
         """If already connected, or in the middle of a connection attempt,
         disconnect.
 
-        Attempt to connect, immediately if this is the first try, or
-        after a backoff period.
+        Attempt to connect, possibly after a backoff period.
 
-        Return a Deferred. A failure to connect, even after backing off,
-        will fire off its error callbacks. If we successfully start
-        consuming the response from Twitter, we fire it with no arguments.
+        Return a Deferred. A failure to connect will fire off its error
+        callbacks. If we successfully start consuming the response from
+        Twitter, we fire it with no arguments.
         """
         if self.state in (CONNECTING, CONNECTED):
             self.disconnect()
@@ -156,8 +156,13 @@ class Stream(object):
             self.dfr_stream_connected = defer.Deferred()
 
         if self.state == BACKING_OFF:
-            reactor.callLater(self.next_backoff, self._do_connect, uri,
-                    http_method, receiver, parameters)
+            # if we start a new connection attempt while previous is backing
+            # off, cancel previous. However, must still respect backoff period.
+            if self.delayed_connect and self.delayed_connect.active():
+                self.disconnect()
+                self.dfr_stream_connected = defer.Deferred()
+            self.delayed_connect = reactor.callLater(self.next_backoff,
+                    self._do_connect, uri, http_method, receiver, parameters)
         else:
             self._do_connect(uri, http_method, receiver, parameters)
 
@@ -175,7 +180,7 @@ class Stream(object):
         def connection_failed(reason):
             log.err(reason, 'connection failed %s' % reason)
             self.next_backoff = _calculate_backoff(reason, self.next_backoff)
-            if 0 < self.next_backoff <= MAX_BACKOFF:
+            if 0 < self.next_backoff < MAX_BACKOFF:
                 log.msg('Backing off %ss' % self.next_backoff)
                 self._advance_state_to(BACKING_OFF)
                 self._connect(uri, http_method, receiver, parameters)
@@ -187,9 +192,11 @@ class Stream(object):
             """Called with the HTTP response object
             """
             if response.code == 200:
-                response.deliverBody(TwitterStreamingProtocol(receiver))
                 self._advance_state_to(CONNECTED)
-                self.dfr_stream_connected.callback(None)
+                response.deliverBody(TwitterStreamingProtocol(receiver))
+                # clear own reference to deferred, then fire
+                d, self.dfr_stream_connected = self.dfr_stream_connected, None
+                d.callback(None)
             else:
                 connection_failed(Failure(response.code))
 
@@ -201,6 +208,12 @@ class Stream(object):
             request = self._build_request(http_method, uri, parameters)
             self.dfr_got_response = self.connected_http.request(request)
             self.dfr_got_response.addCallbacks(got_response, connection_failed)
+
+            def timeout_if_unsuccessful(deferred):
+                if not deferred.called:
+                    deferred.cancel()
+            reactor.callLater(HTTP_TIMEOUT, timeout_if_unsuccessful, 
+                    self.dfr_got_response)
 
         self.dfr_reached_host = ENDPOINT.connect(FACTORY)
         self.dfr_reached_host.addCallbacks(protocol_connected, connection_failed)
@@ -216,45 +229,49 @@ class Stream(object):
             self.connected_http._giveUp(reason)
             self.connected_http = None
 
-        if self.dfr_reached_host is not None:
+        if self.delayed_connect and self.delayed_connect.active():
+            self.delayed_connect.cancel()
+
+        if self.dfr_reached_host and not self.dfr_reached_host.called:
             self.dfr_reached_host.cancel()
-            self.dfr_reached_host = None
+        self.dfr_reached_host = None
 
-        if self.dfr_got_response is not None:
+        if self.dfr_got_response and not self.dfr_got_response.called:
             self.dfr_got_response.cancel()
-            self.dfr_got_response = None
+        self.dfr_got_response = None
 
-        if self.dfr_stream_connected is not None:
-            try:
-                self.dfr_stream_connected.errback(
-                    Failure(error.ConnectionDone('disconnected')))
-            except (AlreadyCalledError, CancelledError):
-                pass
-            self.dfr_stream_connected = None
+        if self.dfr_stream_connected and not self.dfr_stream_connected.called:
+            self.dfr_stream_connected.errback(Failure(
+                    error.ConnectionDone('disconnected')))
+        self.dfr_stream_connected = None
+
         self._advance_state_to(DISCONNECTED)
 
     def sample(self, receiver, parameters=None):
-        """Receive ~1% of all twitter statuses. 'receiver' must be 
-        an instance of twistedstream.protocol.IStreamReceiver
+        """Receive ~1% of all twitter statuses. 'receiver' must
+        implement  twistedstream.protocol.IStreamReceiver
         """
         return self._connect(SAMPLE, 'GET', receiver, parameters)
 
     def filter(self, receiver, parameters=None):
-        """Filter twitter statuses according to parameters. 'receiver' 
-        must be an instance of twistedstream.protocol.IStreamReceiver
+        """Filter twitter statuses according to parameters. 'receiver'
+        must implement twistedstream.protocol.IStreamReceiver
         """
         return self._connect(FILTER, 'POST', receiver, parameters)
 
     def follow(self, receiver, follows):
-        """Follow a list of twitter users. 'receiver' must be an 
-        instance of twistedstream.protocol.IStreamReceiver
+        """Follow a list of twitter users. 'receiver' must implement
+        twistedstream.protocol.IStreamReceiver
         """
         return self.filter(receiver, {'follow': ','.join(follows)})
 
     def track(self, receiver, terms):
-        """Track a list of search terms. 'receiver' must be an 
-        instance of twistedstream.protocol.IStreamReceiver
+        """Track a list of search terms. 'receiver' must implement
+        twistedstream.protocol.IStreamReceiver
         """
+        for term in terms:
+            if len(term) > 60:
+                raise ValueError('Terms must be 60 chars or fewer in length.')
         return self.filter(receiver, {'track': ','.join(terms)})
 
 
