@@ -37,7 +37,6 @@ HTTP_ERRORS = {
 }
 MAX_BACKOFF = 120
 RECOVERABLE_BACKOFFS = {
-    401: lambda x: x * 2 if x >= 10 else 10, # Twitter occasionally throws unnecessary 401s
     420: lambda x: MAX_BACKOFF,
     500: lambda x: x * 2 if x >= 10 else 10,
     503: lambda x: x * 4 if x >= 10 else 10, # backoff more aggressively
