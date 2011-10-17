@@ -2,12 +2,14 @@ import unittest
 from mock import Mock
 
 from twistedstream.protocol import IStreamReceiver, TwitterStreamingProtocol
+from twistedstream.stream import Stream, DISCONNECTED, CONNECTED
 
 
 class TwitterStreamingProtocolTests(unittest.TestCase):
     def setUp(self):
         self.receiver = Mock(spec=IStreamReceiver)
-        self.protocol = TwitterStreamingProtocol(self.receiver)
+        self.stream = Stream(None, None)
+        self.protocol = TwitterStreamingProtocol(self.receiver, self.stream)
 
     def test_deletion_notice(self):
         line = '{"delete":{"status":{"id":1234,"id_str":"1234","user_id":3,"user_id_str":"3"}}}'
@@ -39,8 +41,10 @@ class TwitterStreamingProtocolTests(unittest.TestCase):
         self.assertTrue(self.receiver.invalid.called)
 
     def test_disconnected(self):
+        self.stream.state = CONNECTED
         self.protocol.connectionLost(None)
         self.assertTrue(self.receiver.disconnected.called)
+        self.assertEquals(DISCONNECTED, self.stream.state)
 
     def test_timeout(self):
         self.protocol.timeoutConnection()

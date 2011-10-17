@@ -192,7 +192,7 @@ class Stream(object):
             """
             if response.code == 200:
                 self._advance_state_to(CONNECTED)
-                response.deliverBody(TwitterStreamingProtocol(receiver))
+                response.deliverBody(TwitterStreamingProtocol(receiver, self))
                 # clear own reference to deferred, then fire
                 d, self.dfr_stream_connected = self.dfr_stream_connected, None
                 d.callback(None)

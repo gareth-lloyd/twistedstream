@@ -35,9 +35,10 @@ class IStreamReceiver(object):
         pass
 
 class TwitterStreamingProtocol(LineOnlyReceiver, TimeoutMixin):
-    def __init__(self, receiver, timeout_seconds=60):
-        self.setTimeout(timeout_seconds)
+    def __init__(self, receiver, stream, timeout_seconds=60):
         self.receiver = receiver
+        self.stream = stream
+        self.setTimeout(timeout_seconds)
 
     def lineReceived(self, line):
         self.resetTimeout()
@@ -61,6 +62,7 @@ class TwitterStreamingProtocol(LineOnlyReceiver, TimeoutMixin):
 
     def connectionLost(self, reason):
         self.receiver.disconnected(reason)
+        self.stream.disconnect(reason)
 
     def timeoutConnection(self):
         self.receiver.disconnected(failure.Failure(error.ConnectionLost()))
