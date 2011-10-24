@@ -282,7 +282,7 @@ def _urlencode(headers):
     for key, value in headers.iteritems():
         encoded.append("%s=%s" %
             (quote(key.encode("utf-8")),
-            quote(value.encode("utf-8"))))
+            quote(value.encode("utf-8"), safe='')))
     return '&'.join(encoded)
 
 def _format_headers(headers):
