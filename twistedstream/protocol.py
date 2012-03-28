@@ -61,8 +61,9 @@ class TwitterStreamingProtocol(LineOnlyReceiver, TimeoutMixin):
                 self.receiver.invalid(line)
 
     def connectionLost(self, reason):
-        self.receiver.disconnected(reason)
         self.stream.disconnect(reason)
+        self.receiver.disconnected(reason)
 
     def timeoutConnection(self):
+        self.stream.disconnect(failure.Failure(error.ConnectionLost()))
         self.receiver.disconnected(failure.Failure(error.ConnectionLost()))
