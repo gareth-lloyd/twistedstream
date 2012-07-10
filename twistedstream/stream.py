@@ -224,8 +224,9 @@ class Stream(object):
         """
         if self.connected_http is not None:
             if reason is None:
-                reason = Failure(error.ConnectionDone('Done listening'))
-            self.connected_http._giveUp(reason)
+                self.connected_http.abort()
+            else:
+                self.connected_http._giveUp(reason)
             self.connected_http = None
 
         if self.delayed_connect and self.delayed_connect.active():
