@@ -8,7 +8,7 @@ try:
 except:
     pass
 
-VERSION = '0.1'
+VERSION = '0.11'
 print VERSION
 
 setup(name='twistedstream',
