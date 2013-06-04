@@ -2,7 +2,7 @@ import unittest
 from mock import Mock
 
 from twistedstream.protocol import IStreamReceiver, TwitterStreamingProtocol
-from twistedstream.stream import Stream, DISCONNECTED, CONNECTED
+from twistedstream.stream import Stream, CONNECTED, FINISHED
 
 
 class TwitterStreamingProtocolTests(unittest.TestCase):
@@ -44,9 +44,10 @@ class TwitterStreamingProtocolTests(unittest.TestCase):
         self.stream.state = CONNECTED
         self.protocol.connectionLost(None)
         self.assertTrue(self.receiver.disconnected.called)
-        self.assertEquals(DISCONNECTED, self.stream.state)
+        self.assertEquals(FINISHED, self.stream.state)
 
     def test_timeout(self):
+        self.stream.state = CONNECTED
         self.protocol.timeoutConnection()
         self.assertTrue(self.receiver.disconnected.called)
 
